@@ -11,11 +11,14 @@ import (
 )
 
 type MetricDefinition struct {
-	Name  string  `json:"name" gorm:"not null"`
-	Unit  string  `json:"unit" gorm:"not null"`
-	Min   float64 `json:"min"`
-	Max   float64 `json:"max"`
-	Drift float64 `json:"drift"`
+	Name             string  `json:"name" gorm:"not null"`
+	Unit             string  `json:"unit" gorm:"not null"`
+	Kind             string  `json:"kind,omitempty"`
+	Min              float64 `json:"min"`
+	Max              float64 `json:"max"`
+	Drift            float64 `json:"drift"`
+	InitialValue     float64 `json:"initialValue,omitempty"`
+	IncrementPerTick float64 `json:"incrementPerTick,omitempty"`
 }
 
 type MetricDefinitions []MetricDefinition
@@ -151,14 +154,21 @@ func ValidateMetricDefinitions(metrics []MetricDefinition) error {
 
 	seen := make(map[string]struct{}, len(metrics))
 	for _, metric := range metrics {
+		kind := metric.Kind
+		if kind == "" {
+			kind = "GAUGE"
+		}
 		if metric.Name == "" {
 			return errors.New("metric name is required")
 		}
 		if metric.Unit == "" {
 			return fmt.Errorf("metric %q unit is required", metric.Name)
 		}
-		if metric.Min >= metric.Max {
+		if kind != "COUNTER" && metric.Min >= metric.Max {
 			return fmt.Errorf("metric %q min must be less than max", metric.Name)
+		}
+		if kind != "GAUGE" && kind != "COUNTER" && kind != "LEVEL" {
+			return fmt.Errorf("metric %q has unsupported kind %q", metric.Name, metric.Kind)
 		}
 		if _, exists := seen[metric.Name]; exists {
 			return fmt.Errorf("duplicate metric definition %q", metric.Name)

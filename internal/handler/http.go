@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 
 	"equipment-telemetry-simulator/internal/model"
@@ -31,6 +33,7 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/assets", a.registerAsset)
 	mux.HandleFunc("GET /api/v1/assets", a.listAssets)
 	mux.HandleFunc("PUT /api/v1/assets/{assetId}/faults", a.replaceFaults)
+	mux.HandleFunc("GET /api/v1/ws", a.websocket)
 
 	return recoverMiddleware(corsMiddleware(loggingMiddleware(a.logger, mux)))
 }
@@ -173,6 +176,14 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("response writer does not support hijacking")
+	}
+	return hijacker.Hijack()
 }
 
 func loggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {

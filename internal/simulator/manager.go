@@ -332,10 +332,11 @@ func (m *Manager) tickAssetLocked(asset *model.Asset, assetType model.AssetTypeD
 	}
 
 	for _, definition := range assetType.Metrics {
+		kind := metricKind(definition)
 		current, ok := asset.Metrics[definition.Name]
 		if !ok {
 			current = model.MetricValue{
-				Value: m.randomBetween(definition.Min, definition.Max),
+				Value: m.initialMetricValueLocked(definition),
 				Unit:  definition.Unit,
 			}
 		}
@@ -345,9 +346,24 @@ func (m *Manager) tickAssetLocked(asset *model.Asset, assetType model.AssetTypeD
 			drift = (definition.Max - definition.Min) * 0.05
 		}
 
-		next := current.Value + m.randomBetween(-drift, drift)
-		if next < definition.Min || next > definition.Max {
-			next = m.randomBetween(definition.Min, definition.Max)
+		next := current.Value
+		switch kind {
+		case "COUNTER":
+			increment := definition.IncrementPerTick
+			if increment <= 0 {
+				increment = math.Max(definition.Drift, 0.01)
+			}
+			next = current.Value + increment
+		case "LEVEL":
+			next = current.Value - math.Abs(drift)
+			if next < definition.Min {
+				next = definition.Max
+			}
+		default:
+			next = current.Value + m.randomBetween(-drift, drift)
+			if next < definition.Min || next > definition.Max {
+				next = m.randomBetween(definition.Min, definition.Max)
+			}
 		}
 
 		asset.Metrics[definition.Name] = model.MetricValue{
@@ -416,9 +432,9 @@ func (m *Manager) restoreNormalMetricsLocked(asset *model.Asset, assetType model
 
 	for _, definition := range assetType.Metrics {
 		current, ok := asset.Metrics[definition.Name]
-		if !ok || current.Value < definition.Min || current.Value > definition.Max {
+		if !ok || (metricKind(definition) != "COUNTER" && (current.Value < definition.Min || current.Value > definition.Max)) {
 			current = model.MetricValue{
-				Value: m.randomBetween(definition.Min, definition.Max),
+				Value: m.initialMetricValueLocked(definition),
 				Unit:  definition.Unit,
 			}
 		}
@@ -432,11 +448,21 @@ func (m *Manager) initialMetricsLocked(assetType model.AssetTypeDefinition) mode
 	metrics := make(model.MetricsMap, len(assetType.Metrics))
 	for _, definition := range assetType.Metrics {
 		metrics[definition.Name] = model.MetricValue{
-			Value: m.round(m.randomBetween(definition.Min, definition.Max)),
+			Value: m.round(m.initialMetricValueLocked(definition)),
 			Unit:  definition.Unit,
 		}
 	}
 	return metrics
+}
+
+func (m *Manager) initialMetricValueLocked(definition model.MetricDefinition) float64 {
+	if definition.InitialValue != 0 {
+		return definition.InitialValue
+	}
+	if metricKind(definition) == "COUNTER" {
+		return math.Max(definition.Min, 0)
+	}
+	return m.randomBetween(definition.Min, definition.Max)
 }
 
 func (m *Manager) setMetric(asset *model.Asset, definition model.MetricDefinition, value float64) {
@@ -491,6 +517,13 @@ func dedupeStrings(values []string) []string {
 		deduped = append(deduped, value)
 	}
 	return deduped
+}
+
+func metricKind(definition model.MetricDefinition) string {
+	if definition.Kind == "" {
+		return "GAUGE"
+	}
+	return strings.ToUpper(definition.Kind)
 }
 
 func stringInSlice(value string, values []string) bool {
