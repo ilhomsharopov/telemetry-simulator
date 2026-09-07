@@ -29,10 +29,14 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("OPTIONS /", a.options)
 	mux.HandleFunc("GET /healthz", a.health)
 	mux.HandleFunc("POST /api/v1/asset-types", a.createAssetType)
+	mux.HandleFunc("PUT /api/v1/asset-types", a.upsertAssetType)
 	mux.HandleFunc("GET /api/v1/asset-types", a.listAssetTypes)
 	mux.HandleFunc("POST /api/v1/assets", a.registerAsset)
+	mux.HandleFunc("PUT /api/v1/assets", a.ensureAsset)
 	mux.HandleFunc("GET /api/v1/assets", a.listAssets)
 	mux.HandleFunc("PUT /api/v1/assets/{assetId}/faults", a.replaceFaults)
+	mux.HandleFunc("PUT /api/v1/assets/{assetId}/operating-profile", a.setOperatingProfile)
+	mux.HandleFunc("PUT /api/v1/assets/{assetId}/running", a.setRunning)
 	mux.HandleFunc("GET /api/v1/ws", a.websocket)
 
 	return recoverMiddleware(corsMiddleware(loggingMiddleware(a.logger, mux)))
@@ -77,6 +81,58 @@ func (a *API) createAssetType(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, created)
 }
 
+func (a *API) upsertAssetType(w http.ResponseWriter, r *http.Request) {
+	var req model.CreateAssetTypeRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.ID == nil || req.Name == nil || req.Metrics == nil {
+		writeJSON(w, http.StatusBadRequest, model.ErrorResponse{Error: "id, name, and metrics are required"})
+		return
+	}
+	definition := model.AssetTypeDefinition{
+		ID:      *req.ID,
+		Name:    *req.Name,
+		Metrics: model.MetricDefinitions(*req.Metrics),
+	}
+	if req.Description != nil {
+		definition.Description = *req.Description
+	}
+	if req.FaultTypes != nil {
+		definition.FaultTypes = *req.FaultTypes
+	}
+	saved, err := a.manager.UpsertAssetType(definition)
+	if err != nil {
+		writeManagerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, saved)
+}
+
+func (a *API) ensureAsset(w http.ResponseWriter, r *http.Request) {
+	var req model.RegisterAssetRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.AssetID == nil || req.AssetTypeID == nil {
+		writeJSON(w, http.StatusBadRequest, model.ErrorResponse{Error: "assetId and assetTypeId are required"})
+		return
+	}
+	asset, err := a.manager.EnsureAsset(*req.AssetID, *req.AssetTypeID)
+	if err != nil {
+		writeManagerError(w, err)
+		return
+	}
+	if req.OperatingProfile != nil {
+		asset, err = a.manager.SetOperatingProfile(*req.AssetID, *req.OperatingProfile)
+		if err != nil {
+			writeManagerError(w, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, asset)
+}
+
 func (a *API) listAssetTypes(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, a.manager.ListAssetTypes())
 }
@@ -97,6 +153,13 @@ func (a *API) registerAsset(w http.ResponseWriter, r *http.Request) {
 		writeManagerError(w, err)
 		return
 	}
+	if req.OperatingProfile != nil {
+		asset, err = a.manager.SetOperatingProfile(*req.AssetID, *req.OperatingProfile)
+		if err != nil {
+			writeManagerError(w, err)
+			return
+		}
+	}
 	writeJSON(w, http.StatusCreated, asset)
 }
 
@@ -116,6 +179,36 @@ func (a *API) replaceFaults(w http.ResponseWriter, r *http.Request) {
 	}
 
 	asset, err := a.manager.ReplaceFaults(r.PathValue("assetId"), *req.FaultTypes)
+	if err != nil {
+		writeManagerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, asset)
+}
+
+func (a *API) setOperatingProfile(w http.ResponseWriter, r *http.Request) {
+	var profile model.OperatingProfile
+	if !decodeJSON(w, r, &profile) {
+		return
+	}
+	asset, err := a.manager.SetOperatingProfile(r.PathValue("assetId"), profile)
+	if err != nil {
+		writeManagerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, asset)
+}
+
+func (a *API) setRunning(w http.ResponseWriter, r *http.Request) {
+	var req model.SetRunningRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Running == nil {
+		writeJSON(w, http.StatusBadRequest, model.ErrorResponse{Error: "running is required"})
+		return
+	}
+	asset, err := a.manager.SetRunning(r.PathValue("assetId"), *req.Running)
 	if err != nil {
 		writeManagerError(w, err)
 		return
@@ -159,7 +252,9 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Access-Control-Request-Private-Network")
+		// Chrome Private Network Access: public site (toir.tenzorsoft.uz) -> LAN IP (192.168.x.x)
+		w.Header().Set("Access-Control-Allow-Private-Network", "true")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

@@ -170,11 +170,22 @@ Recommended metric definition shape:
   "unit": "h",
   "kind": "COUNTER",
   "initialValue": 1240.5,
-  "incrementPerTick": 0.01
+  "ratePerHour": 1
 }
 ```
 
-The current code supports `kind`, `initialValue`, and `incrementPerTick`, so motochas can be modeled as a real monotonic counter.
+Counters grow in real time, not per tick: the delta is `ratePerHour * elapsedHours`, and it is only applied while the asset's operating profile says the asset is operating. When `ratePerHour` is omitted, the rate comes from the unit and the profile:
+
+| Unit | Rate per operating hour |
+| --- | --- |
+| `h`, `hr`, `hour`, `hours` | `1` |
+| `km` (or anything containing `kilomet`) | `avgSpeedKmh` (default 40) |
+| `kwh` | `ratedKw` (default 10) |
+| `t`, `ton`, `tons` | `tonsPerHour` (default 1) |
+| `cycle`, `cycles` | `cyclesPerHour` (default 60) |
+| anything else | `1` |
+
+The legacy `incrementPerTick` field is still accepted by the API for backwards compatibility but is ignored on tick.
 
 ### `LEVEL`
 
@@ -308,6 +319,7 @@ Runtime environment variables:
 | `TICK_INTERVAL` | `2s` | Simulation update interval |
 | `PUSH_MODE` | `false` | Enables outbound telemetry POST push |
 | `TARGET_TOIR_URL` | empty | Target URL when push mode is enabled |
+| `TOIR_TELEMETRY_INGEST_SECRET` | empty | Shared secret sent as `X-Toir-Telemetry-Secret` |
 | `PUSH_INTERVAL` | `TICK_INTERVAL` | Outbound push interval |
 
 ## Run
@@ -382,13 +394,13 @@ curl -s -X POST http://localhost:8080/api/v1/asset-types \
       { "name": "air_pressure_psi", "unit": "psi", "kind": "GAUGE", "min": 90, "max": 120, "drift": 2.5 },
       { "name": "air_volume_m3_min", "unit": "m3/min", "kind": "GAUGE", "min": 8, "max": 14, "drift": 0.5 },
       { "name": "oil_volume_liters", "unit": "L", "kind": "LEVEL", "min": 12, "max": 22, "drift": 0.2 },
-      { "name": "engine_hours", "unit": "h", "kind": "COUNTER", "min": 0, "max": 999999, "drift": 0.01, "initialValue": 1240.5, "incrementPerTick": 0.01 }
+      { "name": "engine_hours", "unit": "h", "kind": "COUNTER", "min": 0, "max": 999999, "drift": 0.01, "initialValue": 1240.5, "ratePerHour": 1 }
     ],
     "faultTypes": ["OVERHEATING", "PRESSURE_DROP", "VOLUME_DROP", "OIL_LEAK"]
   }' | jq
 ```
 
-Note: `engine_hours` is now treated as a monotonic counter when `kind` is `COUNTER`. It increases by `incrementPerTick`; if that field is not provided, the simulator uses `drift`, then falls back to `0.01`.
+Note: `engine_hours` is a monotonic counter when `kind` is `COUNTER`. It grows by `ratePerHour * elapsedHours` of wall-clock time, and only while the asset's operating profile marks it as operating. If `ratePerHour` is omitted, the rate is derived from the unit.
 
 ### List Assets
 
@@ -439,8 +451,73 @@ curl -s -X POST http://localhost:8080/api/v1/assets \
   -H "Content-Type: application/json" \
   -d '{
     "assetId": "COMP-401",
-    "assetTypeId": "COMPRESSOR_ADVANCED"
+    "assetTypeId": "COMPRESSOR_ADVANCED",
+    "operatingProfile": { "mode": "CONTINUOUS" }
   }' | jq
+```
+
+`operatingProfile` is optional; when omitted the asset defaults to `CONTINUOUS`.
+
+### Operating Profiles
+
+An operating profile decides whether counters grow at a given moment, so a truck that works one shift a day does not accumulate 24 hours of engine time per day.
+
+| Mode | Meaning |
+| --- | --- |
+| `CONTINUOUS` | Operates around the clock (process equipment, pumps, compressors). |
+| `SHIFT` | Operates only inside the configured weekday/time windows. |
+| `OUT_OF_SERVICE` | Never operates; counters freeze at their last value. |
+
+```http
+PUT /api/v1/assets/{assetId}/operating-profile
+```
+
+```bash
+curl -s -X PUT http://localhost:8080/api/v1/assets/COMP-401/operating-profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "SHIFT",
+    "timezone": "Asia/Tashkent",
+    "startHour": 8,
+    "hoursPerDay": 8,
+    "daysOfWeek": [1, 2, 3, 4, 5, 6],
+    "avgSpeedKmh": 40
+  }' | jq
+```
+
+Profile fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `CONTINUOUS` | `CONTINUOUS`, `SHIFT`, or `OUT_OF_SERVICE`. |
+| `timezone` | `Asia/Tashkent` | IANA zone used to evaluate the shift window. |
+| `startHour` | `8` | Local hour the shift starts (0-23). |
+| `hoursPerDay` | `8` | Shift length in hours; `24` means always on for the allowed days. |
+| `daysOfWeek` | `[1,2,3,4,5,6]` | ISO weekdays, 1 = Monday ... 7 = Sunday. |
+| `stoppedUntil` | none | While `now` is before this timestamp the asset does not operate in any mode. |
+| `avgSpeedKmh` | `40` | Rate for `km` counters without `ratePerHour`. |
+| `ratedKw` | `10` | Rate for `kwh` counters without `ratePerHour`. |
+| `cyclesPerHour` | `60` | Rate for cycle counters without `ratePerHour`. |
+| `tonsPerHour` | `1` | Rate for tonnage counters without `ratePerHour`. |
+
+A shift that crosses midnight is supported: `startHour: 22` with `hoursPerDay: 8` runs 22:00-06:00.
+
+### Start and Stop an Asset
+
+```http
+PUT /api/v1/assets/{assetId}/running
+```
+
+Stopping switches the asset to `OUT_OF_SERVICE` and remembers the previous profile; starting restores it. Counters keep their last value while stopped, which is what TOIR needs for odometer and engine-hour history.
+
+```bash
+curl -s -X PUT http://localhost:8080/api/v1/assets/COMP-401/running \
+  -H "Content-Type: application/json" \
+  -d '{ "running": false }' | jq
+
+curl -s -X PUT http://localhost:8080/api/v1/assets/COMP-401/running \
+  -H "Content-Type: application/json" \
+  -d '{ "running": true }' | jq
 ```
 
 ### Replace Asset Faults
@@ -529,6 +606,7 @@ Errors:
 | `assets.list` | Returns all running asset instances with current telemetry. |
 | `assets.register` | Registers a new asset instance from an asset type. |
 | `assets.faults.replace` | Replaces active faults for an asset. |
+| `assets.running.set` | Starts or stops an asset (`{ "assetId": "...", "running": false }`). |
 | `assets.subscribe` | Starts realtime `assets.snapshot` events every 2 seconds. |
 | `assets.unsubscribe` | Stops realtime asset snapshot events. |
 
@@ -679,9 +757,7 @@ Seeded assets:
 - `PUMP-102`
 - `COMP-301`
 
-## Current Implementation vs Required Counter Support
-
-Current implementation:
+## Counter Model
 
 ```text
 MetricDefinition:
@@ -692,38 +768,27 @@ MetricDefinition:
   - max
   - drift
   - initialValue
-  - incrementPerTick
+  - ratePerHour        (real-time rate; falls back to a unit-based default)
+  - incrementPerTick   (legacy, accepted but ignored on tick)
 ```
 
-Current tick behavior:
+Tick behavior, where `elapsedHours` is the real time since the previous tick and `operating` comes from the asset's operating profile:
 
 ```text
-GAUGE   -> newValue = oldValue +/- drift
-COUNTER -> newValue = oldValue + incrementPerTick
-LEVEL   -> newValue = oldValue - abs(drift)
+drift   = definition.drift, or (max - min) * 0.05 when drift is not set
+
+GAUGE   -> newValue = oldValue + random(-drift, +drift)
+           if it leaves [min, max] it is re-seeded randomly inside [min, max]
+COUNTER -> newValue = oldValue + rate * elapsedHours          (only while operating, 6 decimals)
+LEVEL   -> newValue = oldValue - (ratePerHour or |drift|) * elapsedHours
+                                                              (only while operating, floored at min)
 ```
 
-This is good for:
+`elapsedHours` is measured from the previous tick and is capped at 30 seconds, so a simulator that was down for an hour does not jump the counters by an hour on the next tick.
 
-- temperature
-- pressure
-- vibration
-- flow
-- volume rate
+While the asset is not operating (off-shift, stopped, or `OUT_OF_SERVICE`), counters and levels keep their last value, so the value pushed to TOIR stays stable instead of drifting.
 
-Simulation logic:
-
-```text
-GAUGE:
-  value can go up/down within min/max
-
-COUNTER:
-  value = value + increment
-  never decreases
-
-LEVEL:
-  value can decrease/increase by configured direction
-```
+Gauges are good for temperature, pressure, vibration, flow, and volume rate. Counters model odometers, engine hours, energy, and cycle counts. Levels model fuel and other tanks that drain while the asset works.
 
 ## Important Design Note
 

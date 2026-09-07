@@ -47,7 +47,13 @@ func main() {
 			logger.Error("PUSH_MODE=true requires TARGET_TOIR_URL")
 			os.Exit(1)
 		}
-		pushClient = simulator.NewPushClient(targetURL)
+		ingestSecret := strings.TrimSpace(os.Getenv("TOIR_TELEMETRY_INGEST_SECRET"))
+		if ingestSecret == "" {
+			logger.Error("PUSH_MODE=true requires TOIR_TELEMETRY_INGEST_SECRET")
+			os.Exit(1)
+		}
+		pushClient = simulator.NewPushClient(targetURL, ingestSecret)
+		logger.Info("telemetry push enabled", "target", targetURL, "interval", pushInterval.String())
 	}
 
 	manager, err := simulator.NewManager(db, simulator.Config{

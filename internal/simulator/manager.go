@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,7 @@ type Manager struct {
 	pushClient  *PushClient
 	pushEvery   time.Duration
 	roundDigits int
+	lastTick    time.Time
 }
 
 type Config struct {
@@ -147,6 +149,88 @@ func (m *Manager) CreateAssetType(def model.AssetTypeDefinition) (model.AssetTyp
 	return def, nil
 }
 
+func (m *Manager) UpsertAssetType(def model.AssetTypeDefinition) (model.AssetTypeDefinition, error) {
+	def.ID = strings.TrimSpace(def.ID)
+	def.Name = strings.TrimSpace(def.Name)
+	if def.ID == "" {
+		return model.AssetTypeDefinition{}, fmt.Errorf("%w: asset type id is required", ErrInvalidRequest)
+	}
+	if def.Name == "" {
+		return model.AssetTypeDefinition{}, fmt.Errorf("%w: asset type name is required", ErrInvalidRequest)
+	}
+	if err := model.ValidateMetricDefinitions(def.Metrics); err != nil {
+		return model.AssetTypeDefinition{}, fmt.Errorf("%w: %s", ErrInvalidRequest, err)
+	}
+	def.FaultTypes = dedupeStrings(def.FaultTypes)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if existing, exists := m.assetTypes[def.ID]; exists {
+		def.CreatedAt = existing.CreatedAt
+		if err := m.db.Save(&def).Error; err != nil {
+			return model.AssetTypeDefinition{}, fmt.Errorf("update asset type definition: %w", err)
+		}
+	} else {
+		if err := m.db.Create(&def).Error; err != nil {
+			return model.AssetTypeDefinition{}, fmt.Errorf("create asset type definition: %w", err)
+		}
+	}
+	m.assetTypes[def.ID] = def
+	return def, nil
+}
+
+func (m *Manager) EnsureAsset(assetID, assetTypeID string) (model.Asset, error) {
+	assetID = strings.TrimSpace(assetID)
+	assetTypeID = strings.TrimSpace(assetTypeID)
+	if assetID == "" {
+		return model.Asset{}, ErrMissingIdentifier
+	}
+	if assetTypeID == "" {
+		return model.Asset{}, fmt.Errorf("%w: assetTypeId is required", ErrInvalidRequest)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	assetType, ok := m.assetTypes[assetTypeID]
+	if !ok {
+		return model.Asset{}, fmt.Errorf("%w: %s", ErrAssetTypeNotFound, assetTypeID)
+	}
+
+	if existing, exists := m.assets[assetID]; exists {
+		existing.AssetTypeID = assetTypeID
+		m.syncAssetMetricsLocked(existing, assetType)
+		m.applyTypeInitialValuesLocked(existing, assetType)
+		existing.UpdatedAt = time.Now().UTC()
+		if err := m.db.Save(existing).Error; err != nil {
+			return model.Asset{}, fmt.Errorf("update asset: %w", err)
+		}
+		return cloneAsset(existing), nil
+	}
+
+	asset := &model.Asset{
+		AssetID:          assetID,
+		AssetTypeID:      assetTypeID,
+		Status:           model.AssetStatusRunning,
+		Metrics:          m.initialMetricsLocked(assetType),
+		ActiveFaults:     []string{},
+		OperatingProfile: model.DefaultContinuousProfile(),
+		UpdatedAt:        time.Now().UTC(),
+	}
+	if err := m.db.Create(asset).Error; err != nil {
+		return model.Asset{}, fmt.Errorf("create asset: %w", err)
+	}
+	m.assets[assetID] = asset
+	return cloneAsset(asset), nil
+}
+
+func (m *Manager) applyTypeInitialValuesLocked(asset *model.Asset, assetType model.AssetTypeDefinition) {
+	for _, definition := range assetType.Metrics {
+		m.setMetric(asset, definition, m.initialMetricValueLocked(definition))
+	}
+}
+
 func (m *Manager) ListAssetTypes() []model.AssetTypeDefinition {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -180,18 +264,110 @@ func (m *Manager) RegisterAsset(assetID, assetTypeID string) (model.Asset, error
 	}
 
 	asset := &model.Asset{
-		AssetID:      assetID,
-		AssetTypeID:  assetTypeID,
-		Status:       model.AssetStatusRunning,
-		Metrics:      m.initialMetricsLocked(assetType),
-		ActiveFaults: []string{},
-		UpdatedAt:    time.Now().UTC(),
+		AssetID:          assetID,
+		AssetTypeID:      assetTypeID,
+		Status:           model.AssetStatusRunning,
+		Metrics:          m.initialMetricsLocked(assetType),
+		ActiveFaults:     []string{},
+		OperatingProfile: model.DefaultContinuousProfile(),
+		UpdatedAt:        time.Now().UTC(),
 	}
 
 	if err := m.db.Create(asset).Error; err != nil {
 		return model.Asset{}, fmt.Errorf("create asset: %w", err)
 	}
 	m.assets[assetID] = asset
+	return cloneAsset(asset), nil
+}
+
+func (m *Manager) SetOperatingProfile(assetID string, profile model.OperatingProfile) (model.Asset, error) {
+	assetID = strings.TrimSpace(assetID)
+	if assetID == "" {
+		return model.Asset{}, ErrMissingIdentifier
+	}
+	profile = model.NormalizeOperatingProfile(profile)
+	switch profile.Mode {
+	case model.OperatingModeContinuous, model.OperatingModeShift, model.OperatingModeOutOfService:
+	default:
+		return model.Asset{}, fmt.Errorf("%w: unsupported operating mode", ErrInvalidRequest)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	asset, ok := m.lookupAssetLocked(assetID)
+	if !ok {
+		return model.Asset{}, ErrAssetNotFound
+	}
+	asset.OperatingProfile = profile
+	if profile.Mode == model.OperatingModeOutOfService {
+		asset.Status = model.AssetStatusStopped
+	} else {
+		asset.ResumeProfile = nil
+		if len(asset.ActiveFaults) > 0 {
+			asset.Status = model.AssetStatusFault
+		} else {
+			asset.Status = model.AssetStatusRunning
+		}
+	}
+	asset.UpdatedAt = time.Now().UTC()
+	if err := m.db.Save(asset).Error; err != nil {
+		return model.Asset{}, fmt.Errorf("save operating profile: %w", err)
+	}
+	return cloneAsset(asset), nil
+}
+
+func (m *Manager) SetRunning(assetID string, running bool) (model.Asset, error) {
+	assetID = strings.TrimSpace(assetID)
+	if assetID == "" {
+		return model.Asset{}, ErrMissingIdentifier
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	asset, ok := m.lookupAssetLocked(assetID)
+	if !ok {
+		return model.Asset{}, ErrAssetNotFound
+	}
+
+	current := model.NormalizeOperatingProfile(asset.OperatingProfile)
+	if running {
+		resume := current
+		if current.Mode == model.OperatingModeOutOfService {
+			if asset.ResumeProfile != nil {
+				resume = model.NormalizeOperatingProfile(*asset.ResumeProfile)
+			} else {
+				resume = model.DefaultContinuousProfile()
+			}
+		}
+		if resume.Mode == model.OperatingModeOutOfService {
+			resume = model.DefaultContinuousProfile()
+		}
+		resume.StoppedUntil = nil
+		asset.OperatingProfile = resume
+		asset.ResumeProfile = nil
+		if len(asset.ActiveFaults) > 0 {
+			asset.Status = model.AssetStatusFault
+		} else {
+			asset.Status = model.AssetStatusRunning
+		}
+	} else {
+		if current.Mode != model.OperatingModeOutOfService {
+			copied := current
+			asset.ResumeProfile = &copied
+		}
+		asset.OperatingProfile = model.NormalizeOperatingProfile(model.OperatingProfile{
+			Mode: model.OperatingModeOutOfService,
+		})
+		if len(asset.ActiveFaults) == 0 {
+			asset.Status = model.AssetStatusStopped
+		}
+	}
+	asset.UpdatedAt = time.Now().UTC()
+	if err := m.db.Save(asset).Error; err != nil {
+		return model.Asset{}, fmt.Errorf("save running state: %w", err)
+	}
 	return cloneAsset(asset), nil
 }
 
@@ -203,6 +379,9 @@ func (m *Manager) ListAssets() []model.Asset {
 	for _, asset := range m.assets {
 		assets = append(assets, cloneAsset(asset))
 	}
+	sort.Slice(assets, func(i, j int) bool {
+		return assets[i].UpdatedAt.After(assets[j].UpdatedAt)
+	})
 	return assets
 }
 
@@ -215,7 +394,7 @@ func (m *Manager) ReplaceFaults(assetID string, faultTypes []string) (model.Asse
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	asset, ok := m.assets[assetID]
+	asset, ok := m.lookupAssetLocked(assetID)
 	if !ok {
 		return model.Asset{}, ErrAssetNotFound
 	}
@@ -273,8 +452,16 @@ func (m *Manager) runPusher(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := m.pushClient.Push(ctx, m.ListAssets()); err != nil {
+			result, err := m.pushClient.Push(ctx, m.ListAssets())
+			if err != nil {
 				m.logger.Warn("telemetry push failed", "error", err)
+				continue
+			}
+			if result != nil && (result.Accepted > 0 || result.Rejected > 0) {
+				m.logger.Info("telemetry push",
+					"accepted", result.Accepted,
+					"skipped", result.Skipped,
+					"rejected", result.Rejected)
 			}
 		}
 	}
@@ -286,20 +473,36 @@ func (m *Manager) step() error {
 
 	changed := make([]*model.Asset, 0, len(m.assets))
 	now := time.Now().UTC()
-	for _, asset := range m.assets {
-		if asset.Status == model.AssetStatusStopped {
-			continue
-		}
+	dt := m.tick
+	if !m.lastTick.IsZero() {
+		dt = now.Sub(m.lastTick)
+	}
+	m.lastTick = now
+	dt = clampSimulationDelta(dt, m.tick)
 
+	for _, asset := range m.assets {
 		assetType, ok := m.assetTypes[asset.AssetTypeID]
 		if !ok {
 			m.logger.Warn("asset type missing for asset", "assetId", asset.AssetID, "assetTypeId", asset.AssetTypeID)
 			continue
 		}
 
-		m.tickAssetLocked(asset, assetType)
-		if asset.Status == model.AssetStatusFault {
+		operating := model.IsOperating(now, asset.OperatingProfile)
+		if !operating {
+			if len(asset.ActiveFaults) == 0 {
+				asset.Status = model.AssetStatusStopped
+			}
+			asset.UpdatedAt = now
+			changed = append(changed, asset)
+			continue
+		}
+
+		m.tickAssetLocked(asset, assetType, dt)
+		if len(asset.ActiveFaults) > 0 {
+			asset.Status = model.AssetStatusFault
 			m.applyFaultsLocked(asset, assetType)
+		} else {
+			asset.Status = model.AssetStatusRunning
 		}
 		asset.UpdatedAt = now
 		changed = append(changed, asset)
@@ -314,10 +517,12 @@ func (m *Manager) step() error {
 			if err := tx.Model(&model.Asset{}).
 				Where("asset_id = ?", asset.AssetID).
 				Updates(map[string]any{
-					"status":        asset.Status,
-					"metrics":       asset.Metrics,
-					"active_faults": asset.ActiveFaults,
-					"updated_at":    asset.UpdatedAt,
+					"status":            asset.Status,
+					"metrics":           asset.Metrics,
+					"active_faults":     asset.ActiveFaults,
+					"operating_profile": asset.OperatingProfile,
+					"resume_profile":    asset.ResumeProfile,
+					"updated_at":        asset.UpdatedAt,
 				}).Error; err != nil {
 				return fmt.Errorf("update asset %s: %w", asset.AssetID, err)
 			}
@@ -326,7 +531,7 @@ func (m *Manager) step() error {
 	})
 }
 
-func (m *Manager) tickAssetLocked(asset *model.Asset, assetType model.AssetTypeDefinition) {
+func (m *Manager) tickAssetLocked(asset *model.Asset, assetType model.AssetTypeDefinition, dt time.Duration) {
 	if asset.Metrics == nil {
 		asset.Metrics = model.MetricsMap{}
 	}
@@ -349,15 +554,15 @@ func (m *Manager) tickAssetLocked(asset *model.Asset, assetType model.AssetTypeD
 		next := current.Value
 		switch kind {
 		case "COUNTER":
-			increment := definition.IncrementPerTick
-			if increment <= 0 {
-				increment = math.Max(definition.Drift, 0.01)
-			}
-			next = current.Value + increment
+			next = current.Value + model.CounterDelta(definition, asset.OperatingProfile, dt)
 		case "LEVEL":
-			next = current.Value - math.Abs(drift)
+			rate := definition.RatePerHour
+			if rate <= 0 {
+				rate = math.Abs(drift)
+			}
+			next = current.Value - rate*dt.Hours()
 			if next < definition.Min {
-				next = definition.Max
+				next = definition.Min
 			}
 		default:
 			next = current.Value + m.randomBetween(-drift, drift)
@@ -366,8 +571,12 @@ func (m *Manager) tickAssetLocked(asset *model.Asset, assetType model.AssetTypeD
 			}
 		}
 
+		places := 2
+		if kind == "COUNTER" {
+			places = 6
+		}
 		asset.Metrics[definition.Name] = model.MetricValue{
-			Value: m.round(next),
+			Value: m.roundPlaces(next, places),
 			Unit:  definition.Unit,
 		}
 	}
@@ -444,6 +653,31 @@ func (m *Manager) restoreNormalMetricsLocked(asset *model.Asset, assetType model
 	}
 }
 
+func (m *Manager) syncAssetMetricsLocked(asset *model.Asset, assetType model.AssetTypeDefinition) {
+	if asset.Metrics == nil {
+		asset.Metrics = model.MetricsMap{}
+	}
+	keep := make(map[string]struct{}, len(assetType.Metrics))
+	for _, definition := range assetType.Metrics {
+		keep[definition.Name] = struct{}{}
+		current, ok := asset.Metrics[definition.Name]
+		if !ok {
+			current = model.MetricValue{
+				Value: m.round(m.initialMetricValueLocked(definition)),
+				Unit:  definition.Unit,
+			}
+		} else {
+			current.Unit = definition.Unit
+		}
+		asset.Metrics[definition.Name] = current
+	}
+	for name := range asset.Metrics {
+		if _, ok := keep[name]; !ok {
+			delete(asset.Metrics, name)
+		}
+	}
+}
+
 func (m *Manager) initialMetricsLocked(assetType model.AssetTypeDefinition) model.MetricsMap {
 	metrics := make(model.MetricsMap, len(assetType.Metrics))
 	for _, definition := range assetType.Metrics {
@@ -480,21 +714,33 @@ func (m *Manager) randomBetween(minValue, maxValue float64) float64 {
 }
 
 func (m *Manager) round(value float64) float64 {
-	scale := math.Pow(10, float64(m.roundDigits))
+	return m.roundPlaces(value, m.roundDigits)
+}
+
+func (m *Manager) roundPlaces(value float64, places int) float64 {
+	if places < 0 {
+		places = 0
+	}
+	scale := math.Pow(10, float64(places))
 	return math.Round(value*scale) / scale
 }
 
 func cloneAsset(asset *model.Asset) model.Asset {
 	clone := model.Asset{
-		AssetID:      asset.AssetID,
-		AssetTypeID:  asset.AssetTypeID,
-		Status:       asset.Status,
-		Metrics:      make(model.MetricsMap, len(asset.Metrics)),
-		ActiveFaults: append([]string(nil), asset.ActiveFaults...),
-		UpdatedAt:    asset.UpdatedAt,
+		AssetID:          asset.AssetID,
+		AssetTypeID:      asset.AssetTypeID,
+		Status:           asset.Status,
+		Metrics:          make(model.MetricsMap, len(asset.Metrics)),
+		ActiveFaults:     append([]string(nil), asset.ActiveFaults...),
+		OperatingProfile: asset.OperatingProfile,
+		UpdatedAt:        asset.UpdatedAt,
 	}
 	if clone.ActiveFaults == nil {
 		clone.ActiveFaults = []string{}
+	}
+	if asset.ResumeProfile != nil {
+		copied := *asset.ResumeProfile
+		clone.ResumeProfile = &copied
 	}
 	for name, metric := range asset.Metrics {
 		clone.Metrics[name] = metric
@@ -517,6 +763,63 @@ func dedupeStrings(values []string) []string {
 		deduped = append(deduped, value)
 	}
 	return deduped
+}
+
+const maxSimulationDelta = 30 * time.Second
+
+func clampSimulationDelta(dt, tick time.Duration) time.Duration {
+	if dt <= 0 {
+		return tick
+	}
+	if dt > maxSimulationDelta {
+		return maxSimulationDelta
+	}
+	return dt
+}
+
+func (m *Manager) lookupAssetLocked(assetID string) (*model.Asset, bool) {
+	if asset, ok := m.assets[assetID]; ok {
+		return asset, true
+	}
+	for _, candidate := range assetIDAliases(assetID) {
+		if asset, ok := m.assets[candidate]; ok {
+			return asset, true
+		}
+	}
+	return nil, false
+}
+
+func assetIDAliases(assetID string) []string {
+	trimmed := strings.TrimSpace(assetID)
+	aliases := make([]string, 0, 4)
+	seen := map[string]struct{}{trimmed: {}}
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		seen[id] = struct{}{}
+		aliases = append(aliases, id)
+	}
+	if canonical, ok := canonicalToirEquipmentID(trimmed); ok {
+		add(canonical)
+		add("eq-" + canonical)
+		add("toir-" + canonical)
+	}
+	lower := strings.ToLower(trimmed)
+	switch {
+	case strings.HasPrefix(lower, "eq-"):
+		add(trimmed[3:])
+	case strings.HasPrefix(lower, "toir-"):
+		add(trimmed[5:])
+	default:
+		add("eq-" + trimmed)
+		add("toir-" + trimmed)
+	}
+	return aliases
 }
 
 func metricKind(definition model.MetricDefinition) string {

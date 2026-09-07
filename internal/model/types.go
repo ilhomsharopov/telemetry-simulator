@@ -19,6 +19,7 @@ type MetricDefinition struct {
 	Drift            float64 `json:"drift"`
 	InitialValue     float64 `json:"initialValue,omitempty"`
 	IncrementPerTick float64 `json:"incrementPerTick,omitempty"`
+	RatePerHour      float64 `json:"ratePerHour,omitempty"`
 }
 
 type MetricDefinitions []MetricDefinition
@@ -109,12 +110,18 @@ func (m *MetricsMap) Scan(value any) error {
 }
 
 type Asset struct {
-	AssetID      string         `json:"assetId" gorm:"primaryKey;type:varchar(120);column:asset_id"`
-	AssetTypeID  string         `json:"assetTypeId" gorm:"not null;type:varchar(80);index;column:asset_type_id"`
-	Status       AssetStatus    `json:"status" gorm:"type:varchar(20);not null;default:'RUNNING'"`
-	Metrics      MetricsMap     `json:"metrics" gorm:"type:jsonb;not null;default:'{}'"`
-	ActiveFaults pq.StringArray `json:"activeFaults" gorm:"type:text[];not null;default:'{}';column:active_faults"`
-	UpdatedAt    time.Time      `json:"updatedAt" gorm:"autoUpdateTime"`
+	AssetID          string            `json:"assetId" gorm:"primaryKey;type:varchar(120);column:asset_id"`
+	AssetTypeID      string            `json:"assetTypeId" gorm:"not null;type:varchar(80);index;column:asset_type_id"`
+	Status           AssetStatus       `json:"status" gorm:"type:varchar(20);not null;default:'RUNNING'"`
+	Metrics          MetricsMap        `json:"metrics" gorm:"type:jsonb;not null;default:'{}'"`
+	ActiveFaults     pq.StringArray    `json:"activeFaults" gorm:"type:text[];not null;default:'{}';column:active_faults"`
+	OperatingProfile OperatingProfile  `json:"operatingProfile" gorm:"type:jsonb;not null;default:'{}';column:operating_profile"`
+	ResumeProfile    *OperatingProfile `json:"resumeProfile,omitempty" gorm:"type:jsonb;column:resume_profile"`
+	UpdatedAt        time.Time         `json:"updatedAt" gorm:"autoUpdateTime"`
+}
+
+type SetRunningRequest struct {
+	Running *bool `json:"running"`
 }
 
 type CreateAssetTypeRequest struct {
@@ -126,8 +133,9 @@ type CreateAssetTypeRequest struct {
 }
 
 type RegisterAssetRequest struct {
-	AssetID     *string `json:"assetId"`
-	AssetTypeID *string `json:"assetTypeId"`
+	AssetID          *string           `json:"assetId"`
+	AssetTypeID      *string           `json:"assetTypeId"`
+	OperatingProfile *OperatingProfile `json:"operatingProfile,omitempty"`
 }
 
 type ReplaceFaultsRequest struct {

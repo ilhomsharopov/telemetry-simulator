@@ -3,3 +3,9 @@
 .DS_Store
 CLAUDE.md
 AGENT.md
+*.exe
+logs/
+tunnel-hostname.txt
+.flowtoken
+local-eq-sample.json
+local-flow-*
